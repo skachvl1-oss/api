@@ -7,7 +7,7 @@
 //  2. Создай новый проект, положи этот файл в /api/chat.js
 //  3. В настройках Vercel добавь переменную окружения:
 //       ANTHROPIC_API_KEY = sk-ant-... (ключ от Anthropic)
-//  4. Задеплой — получишь URL вида:
+//  4. Задеплой — получишь URL вида: 
 //       https://laserlife-bot.vercel.app/api/chat
 //  5. Этот URL вставь в виджет (файл laserlife-tilda-widget.html)
 //       const LL_BACKEND = 'https://laserlife-bot.vercel.app/api/chat';
