@@ -1,79 +1,200 @@
-// ============================================================
-//  LASERLIFE AI БЭКЕНД — Node.js / Vercel Serverless Function
-//
-//  ИНСТРУКЦИЯ ДЛЯ РАЗРАБОТЧИКА:
-//
-//  1. Создай аккаунт на vercel.com (бесплатно)
-//  2. Создай новый проект, положи этот файл в /api/chat.js
-//  3. В настройках Vercel добавь переменную окружения:
-//       ANTHROPIC_API_KEY = sk-ant-... (ключ от Anthropic)
-//  4. Задеплой — получишь URL вида: 
-//       https://laserlife-bot.vercel.app/api/chat
-//  5. Этот URL вставь в виджет (файл laserlife-tilda-widget.html)
-//       const LL_BACKEND = 'https://laserlife-bot.vercel.app/api/chat';
-// ============================================================
+const fs = require("fs");
+const path = require("path");
 
-const SYSTEM_PROMPT = `Ты — дружелюбный и профессиональный ИИ-ассистент сети студий лазерной эпиляции LaserLife (сайт: laserlife.org).
+const ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
+const MODEL = "claude-sonnet-4-20250514";
 
-ИНФОРМАЦИЯ О КОМПАНИИ:
-- LaserLife — федеральная сеть студий лазерной эпиляции
-- Работают на диодном лазере FG 2000 D+ (совместное производство Германии и США)
-- Мощность лазера: 1200 Вт, подходит для всех 6 типов кожи
-- Процедуры безболезненны, безопасны и комфортны
-- Охлаждение сапфиром до -5°C
-- Зоны: лицо, руки, подмышки, грудь, спина, бикини, ноги
-- Также есть ADSS EMSCULPT — укрепление мышц, 30 мин, 30 000 сокращений
+function readJson(relPath, fallback) {
+  try {
+    const full = path.join(process.cwd(), relPath);
+    return JSON.parse(fs.readFileSync(full, "utf8"));
+  } catch {
+    return fallback;
+  }
+}
 
-АКЦИИ:
-- 2 зоны — 1000 руб.
-- 3 зоны — 1500 руб.
-- Акция «Две зоны бесплатно» при записи
+function readText(relPath, fallback = "") {
+  try {
+    const full = path.join(process.cwd(), relPath);
+    return fs.readFileSync(full, "utf8");
+  } catch {
+    return fallback;
+  }
+}
 
-ПЕРСОНАЛ: Сертифицированные мастера, проходят обучение и сертификацию.
-ЗАПИСЬ: Через кнопку на сайте laserlife.org или по телефону.
+function normalize(text) {
+  return String(text || "").toLowerCase().trim();
+}
 
-КАК ОТВЕЧАТЬ:
-- Коротко, тепло, по делу
-- Умеренно используй эмодзи 💗
-- Только русский язык
-- Если не знаешь — предложи позвонить или зайти на laserlife.org`;
+function detectIntent(text) {
+  const t = normalize(text);
+  const map = [
+    { id: "complaint", re: /(ожог|плохой результат|жалоб|верн(ите|уть) деньг|недоволен)/i },
+    { id: "aggression", re: /(идиот|дура|твар|угрож|пошел|пошла|сук|мат)/i },
+    { id: "medical", re: /(беремен|онколог|диабет|болезн|противопоказ)/i },
+    { id: "booking", re: /(запис|свободн|окн|на\s*завтра|на\s*сегодня)/i },
+    { id: "reschedule", re: /(перенес|другое время|поменять время)/i },
+    { id: "cancel", re: /(отмен|не приду)/i },
+    { id: "check_record", re: /(когда у меня|проверьте запись|я записан|я записана)/i },
+    { id: "price_inquiry", re: /(сколько стоит|цена|прайс|стоимость)/i },
+    { id: "faq", re: /(больно|лазер|подготов|уход|сколько процедур|адрес|где)/i },
+    { id: "greeting", re: /^(привет|здравствуйте|добрый)/i }
+  ];
 
-export default async function handler(req, res) {
-  // Разрешаем запросы с сайта laserlife.org
-  res.setHeader('Access-Control-Allow-Origin', '*'); // Замени * на https://laserlife.org для безопасности
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  const found = map.find((x) => x.re.test(t));
+  return found ? found.id : "general";
+}
 
-  if (req.method === 'OPTIONS') return res.status(200).end();
-  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
+function needsHuman(intent) {
+  return ["complaint", "aggression", "medical"].includes(intent);
+}
 
-  const { messages } = req.body;
-  if (!messages || !Array.isArray(messages)) {
-    return res.status(400).json({ error: 'Invalid messages' });
+function extractLead(text) {
+  const t = String(text || "");
+  const phoneMatch = t.match(/(\+7|8)?[\s(-]*\d{3}[\s)-]*\d{3}[\s-]*\d{2}[\s-]*\d{2}/);
+  const nameMatch = t.match(/(?:меня зовут|я)\s+([А-ЯA-Z][а-яa-z]{1,20})/i);
+  const zoneList = ["бикини", "подмыш", "ног", "рук", "лицо", "усики", "спина", "живот"];
+  const zone = zoneList.find((z) => normalize(t).includes(z)) || null;
+
+  return {
+    name: nameMatch ? nameMatch[1] : null,
+    phone: phoneMatch ? phoneMatch[0] : null,
+    zone
+  };
+}
+
+function ensureQuestionOrCTA(reply) {
+  const r = String(reply || "").trim();
+  if (!r) return "Подскажите, пожалуйста, какую зону вас интересует?";
+  if (/[?]$/.test(r)) return r;
+  return `${r} Какую зону вас интересует?`;
+}
+
+function buildSystemPrompt(kb) {
+  const prices = JSON.stringify(kb.prices, null, 2);
+  const studios = JSON.stringify(kb.studios, null, 2);
+  const faqTop = (kb.faq || []).slice(0, 25).map((x) => `Q: ${x.q}\nA: ${x.a}`).join("\n\n");
+
+  return `
+Ты — Алина, AI-администратор LaserLife.
+Стиль: тепло, уверенно, кратко, 2-4 предложения.
+Каждый ответ заканчивай вопросом или CTA.
+Если жалоба/агрессия/медицинский вопрос: "Передаю вас живому администратору — он свяжется в течение 5 минут".
+Не выдумывай цены, даты, адреса, факты.
+Используй только факты из базы ниже.
+Не обещай негарантированный результат.
+
+АКТУАЛЬНЫЕ ЦЕНЫ И АКЦИИ:
+${prices}
+
+СТУДИИ:
+${studios}
+
+FAQ:
+${faqTop}
+`.trim();
+}
+
+function fallbackReply(intent, kb) {
+  if (intent === "price_inquiry") {
+    const promo = kb.prices?.promotions?.[0];
+    const promoText = promo ? `${promo.title}: ${promo.value}.` : "Сейчас действует акция на комплексные зоны.";
+    return `Цена зависит от зоны. ${promoText} Подскажите, какую зону хотите обработать?`;
+  }
+  if (intent === "booking") {
+    return "Отлично, оформлю запись. Напишите, пожалуйста, ваш телефон, желаемую зону и удобное время?";
+  }
+  if (intent === "reschedule") {
+    return "Без проблем, помогу перенести. Назовите номер телефона, чтобы я нашла вашу запись?";
+  }
+  if (intent === "check_record") {
+    return "Проверю запись прямо сейчас. Подскажите номер телефона в формате +7...";
+  }
+  if (intent === "cancel") {
+    return "Понимаю, помогу отменить запись. Напишите номер телефона, и сразу все проверю?";
+  }
+  return "Я рядом и помогу с подбором процедуры, ценами и записью. Скажите, какой вопрос у вас сейчас?";
+}
+
+async function askAnthropic({ apiKey, systemPrompt, messages }) {
+  const response = await fetch(ANTHROPIC_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01"
+    },
+    body: JSON.stringify({
+      model: MODEL,
+      max_tokens: 500,
+      temperature: 0.2,
+      system: systemPrompt,
+      messages
+    })
+  });
+
+  if (!response.ok) {
+    throw new Error(`Anthropic error: ${response.status}`);
+  }
+
+  const data = await response.json();
+  return data?.content?.[0]?.text || "";
+}
+
+function withCors(res) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+
+module.exports = async (req, res) => {
+  withCors(res);
+  if (req.method === "OPTIONS") {
+    return res.status(200).end();
+  }
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "Method not allowed" });
   }
 
   try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': process.env.ANTHROPIC_API_KEY, // Ключ хранится на сервере, не в коде!
-        'anthropic-version': '2023-06-01'
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 1000,
-        system: SYSTEM_PROMPT,
-        messages: messages.slice(-10) // Берём последние 10 сообщений
-      })
+    const { messages = [] } = req.body || {};
+    const userText = messages[messages.length - 1]?.content || "";
+    const intent = detectIntent(userText);
+    const lead = extractLead(userText);
+    const escalate = needsHuman(intent);
+
+    if (escalate) {
+      return res.status(200).json({
+        reply: "Понимаю вас и благодарю, что написали. Передаю вас живому администратору — он свяжется в течение 5 минут. Подскажите, пожалуйста, номер телефона для связи?",
+        meta: { intent, needsHuman: true, lead }
+      });
+    }
+
+    const kb = {
+      prices: readJson("knowledge/prices.json", { promotions: [] }),
+      studios: readJson("knowledge/studios.json", []),
+      faq: readJson("knowledge/faq.json", [])
+    };
+    const systemPrompt = buildSystemPrompt(kb);
+
+    let reply = "";
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    if (apiKey) {
+      reply = await askAnthropic({ apiKey, systemPrompt, messages });
+    } else {
+      reply = fallbackReply(intent, kb);
+    }
+
+    reply = ensureQuestionOrCTA(reply);
+
+    return res.status(200).json({
+      reply,
+      meta: { intent, needsHuman: false, lead }
     });
-
-    const data = await response.json();
-    const reply = data.content?.map(b => b.text || '').join('') || 'Попробуйте ещё раз.';
-    return res.status(200).json({ reply });
-
   } catch (error) {
-    console.error('Anthropic API error:', error);
-    return res.status(500).json({ error: 'Server error', reply: 'Произошла ошибка. Попробуйте позже.' });
+    return res.status(500).json({
+      reply: "Извините, не получилось обработать запрос. Оставьте номер телефона, и живой администратор свяжется с вами в течение 5 минут?",
+      error: error.message
+    });
   }
-}
+};
